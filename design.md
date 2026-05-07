@@ -2,15 +2,12 @@
 
 ## 1. Tổng quan
 
-**Book Manager** là webapp quản lý sách cá nhân kết hợp mạng xã hội đọc sách, cho phép người dùng:
-- Quản lý tủ sách cá nhân (thêm, sửa, xóa, phân loại)
-- Theo dõi trạng thái đọc (đang đọc, đã đọc, muốn đọc)
-- **Viết review, chia sẻ cảm nhận chi tiết về từng cuốn sách**
-- **Bình luận, thảo luận về sách với cộng đồng người đọc**
-- **Vote (thích / không thích) trên review và bình luận**
-- **Xem tổng hợp cảm nhận của nhiều người về cùng một cuốn sách**
-- Chia sẻ tủ sách, danh sách sách qua link công khai
-- Quản lý việc cho mượn sách
+**Book Manager** là webapp quản lý tủ sách cá nhân, tập trung vào hai việc:
+
+1. **Số hoá tủ sách** — catalog sách đang có, ghi chú mua ở đâu, giá bao nhiêu, có xứng đáng không
+2. **Cho mượn trong cộng đồng** — hiện tại trong phạm vi một toà nhà, người mượn phải đăng ký và chịu trách nhiệm
+
+Social features (review công khai, follow, feed) là optional — xem xét ở Phase 5 sau khi core đã ổn định.
 
 ---
 
@@ -21,52 +18,67 @@
 | Frontend | React + TypeScript + Vite | Fast dev, type-safe |
 | UI | Tailwind CSS + shadcn/ui | Đẹp, flexible, không cần thiết kế từ đầu |
 | State | Zustand | Đơn giản, nhẹ hơn Redux |
-| Rich text editor | Tiptap | Editor viết review với format (bold, quote, spoiler block) |
 | Backend | FastAPI (Python) | Nhanh, auto docs, dùng được thư viện Python |
-| Database | PostgreSQL | Relational, phù hợp quan hệ phức tạp (votes, threads) |
+| Database | PostgreSQL | Relational, phù hợp |
 | ORM | SQLAlchemy + Alembic | Migrations dễ quản lý |
-| Auth | JWT (access + refresh token) | Stateless, đơn giản |
-| Search | PostgreSQL full-text search | Đủ dùng, không cần Elasticsearch |
-| Real-time | Server-Sent Events (SSE) | Thông báo mới, cập nhật vote count real-time |
-| Book metadata | Google Books API | Tự động điền thông tin từ ISBN |
-| File storage | Cloudinary | Lưu ảnh bìa |
-| Cache | Redis | Cache vote counts, hot reviews, session |
+| Auth | Google OAuth 2.0 | Gmail login, không cần quản lý password |
+| Search | PostgreSQL full-text search | Đủ dùng cho scale nhỏ |
+| Book metadata | Google Books API | Auto-fill từ ISBN |
+| File storage | Cloudinary | Lưu ảnh bìa / ảnh thực tế của sách |
 | Deploy | Docker Compose | Local dev đồng nhất |
+
+**Không dùng ngay (thêm sau nếu cần):**
+- Redis — thêm vào Phase 5+ nếu performance cần cải thiện
+- SSE / WebSocket — notifications dùng polling trước (đơn giản hơn nhiều)
+- Tiptap rich text editor — personal notes dùng textarea đơn giản
 
 ---
 
-## 3. Kiến trúc Social Layer
+## 3. Kiến trúc cốt lõi
 
-### 3.1 Khái niệm cốt lõi
+### 3.1 Tách book_catalog và user_books
 
-Hệ thống tách biệt **cuốn sách như một thực thể dùng chung** (canonical book) khỏi **quan hệ cá nhân của user với cuốn sách** (user's copy). Đây là nền tảng để social features hoạt động được.
+Cùng một cuốn "Nhà Giả Kim" có thể được nhiều người sở hữu. Hệ thống tách:
 
 ```
-book_catalog (thực thể chung, 1 bản / ISBN)
-    ├── user_books (quan hệ cá nhân: trạng thái đọc, ghi chú riêng)
-    ├── reviews (cảm nhận công khai, 1 user chỉ viết 1 review / sách)
-    │       ├── review_reactions (emoji reaction: ❤️ 👍 😢 🤔 🔥)
-    │       └── comments (bình luận vào review, có thread)
-    │               └── comment_votes (upvote / downvote bình luận)
-    └── reading_activity (feed hoạt động: ai đang đọc gì)
+book_catalog (thực thể sách chung — 1 bản/ISBN)
+    └── user_books (quan hệ cá nhân: bản sách tôi đang có, ghi chú của tôi)
+            ├── loan_requests (yêu cầu mượn từ người khác)
+            └── loans (phiếu mượn đang active)
 ```
 
 **Tại sao cần tách?**
-- Cùng một cuốn "Nhà Giả Kim", 100 user sở hữu → 100 `user_books` record
-- Nhưng chỉ có 1 entry trong `book_catalog` để tổng hợp: tổng reviews, điểm trung bình, feed thảo luận chung
+- Cùng cuốn "Atomic Habits", 10 người trong toà có thể sở hữu → 10 `user_books` record
+- Nhưng chỉ 1 entry trong `book_catalog` để tra cứu metadata chung
+- Mỗi người có ghi chú riêng (giá mua, cảm nhận...) không ảnh hưởng nhau
 
-### 3.2 Phân quyền trên social content
+### 3.2 Lending flow trong toà nhà
 
-| Hành động | Chưa đăng nhập | Đã đăng nhập | Chính tác giả |
-|-----------|---------------|-------------|--------------|
-| Đọc review | ✅ | ✅ | ✅ |
-| Đọc comment | ✅ | ✅ | ✅ |
-| Vote review | ❌ | ✅ | ❌ (không tự vote) |
-| Vote comment | ❌ | ✅ | ❌ (không tự vote) |
-| Viết review | ❌ | ✅ (phải có sách trong tủ, status=read) | ✅ |
-| Viết comment | ❌ | ✅ | ✅ |
-| Sửa / xóa | ❌ | ❌ | ✅ |
-| Report nội dung | ❌ | ✅ | ✅ |
+```
+Lender đánh dấu sách "sẵn sàng cho mượn"
+    ↓
+Borrower (trong cùng toà nhà) gửi loan_request
+    ↓
+Lender approve (kèm thoả thuận cọc + địa điểm hẹn) hoặc reject
+    ↓ (approved)
+Gặp nhau ngoài đời, trao sách, chuyển khoản cọc
+    ↓
+Lender confirm → loan status = active
+    ↓
+[Thời gian mượn... notification nhắc khi gần hạn]
+    ↓
+Sách trả về → Lender mark returned
+    ↓
+Lender có thể rate borrower (tùy chọn)
+```
+
+> Deposit thực tế xảy ra ngoài hệ thống (bank transfer). App chỉ lưu `agreed_deposit` làm reference.
+
+### 3.3 Trust model
+
+- Người mượn cần xác thực **số điện thoại** khi đăng ký (ngoài Google login)
+- Lender có thể **blacklist** borrower — người bị block không thể gửi request mượn sách của lender đó
+- Rating borrower là **private** (chỉ lender thấy), không public
 
 ---
 
@@ -75,20 +87,30 @@ book_catalog (thực thể chung, 1 bản / ISBN)
 ### 4.1 users
 ```sql
 id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
+google_sub      VARCHAR(255) UNIQUE NOT NULL   -- Google OAuth subject ID
 email           VARCHAR(255) UNIQUE NOT NULL
-password_hash   VARCHAR(255) NOT NULL
 name            VARCHAR(100) NOT NULL
 avatar_url      VARCHAR(500)
-profile_slug    VARCHAR(50) UNIQUE         -- /u/phihong
+phone_number    VARCHAR(20)                    -- bắt buộc để mượn sách
+phone_verified  BOOLEAN DEFAULT FALSE
+profile_slug    VARCHAR(50) UNIQUE             -- /u/phihong
 bio             TEXT
-website_url     VARCHAR(500)
-reading_goal    SMALLINT                   -- mục tiêu số sách/năm
-is_public       BOOLEAN DEFAULT TRUE
+is_public       BOOLEAN DEFAULT TRUE           -- tủ sách có hiện công khai không
+building_id     UUID REFERENCES buildings(id)  -- toà nhà đang ở
 created_at      TIMESTAMP DEFAULT NOW()
 updated_at      TIMESTAMP DEFAULT NOW()
 ```
 
-### 4.2 book_catalog (thực thể sách dùng chung)
+### 4.2 buildings (toà nhà / cộng đồng)
+```sql
+id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
+name            VARCHAR(200) NOT NULL           -- "Vinhomes Central Park T2"
+address         TEXT
+invite_code     VARCHAR(20) UNIQUE              -- code để join toà nhà
+created_at      TIMESTAMP DEFAULT NOW()
+```
+
+### 4.3 book_catalog (thực thể sách chung)
 ```sql
 id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
 isbn            VARCHAR(20) UNIQUE
@@ -101,230 +123,132 @@ language        VARCHAR(10) DEFAULT 'vi'
 page_count      INTEGER
 description     TEXT
 genres          VARCHAR(100)[]
-source          VARCHAR(50)               -- 'google_books' | 'manual'
-
--- Denormalized counters (cập nhật qua trigger hoặc service)
-review_count    INTEGER DEFAULT 0
-avg_rating      NUMERIC(3,2) DEFAULT 0    -- trung bình cộng rating từ reviews
-reader_count    INTEGER DEFAULT 0         -- số user có sách này trong tủ
-
+source          VARCHAR(50)                    -- 'google_books' | 'manual'
 created_at      TIMESTAMP DEFAULT NOW()
 updated_at      TIMESTAMP DEFAULT NOW()
 ```
 
-### 4.3 user_books (quan hệ cá nhân user ↔ sách)
+### 4.4 user_books (tủ sách cá nhân) ← TRỌNG TÂM
 ```sql
 id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
 user_id         UUID REFERENCES users(id) ON DELETE CASCADE
 catalog_id      UUID REFERENCES book_catalog(id)
-tags            VARCHAR(50)[]              -- nhãn cá nhân
-status          VARCHAR(20) NOT NULL       -- 'reading' | 'read' | 'want_to_read' | 'lent_out'
+
+-- Trạng thái đọc
+status          VARCHAR(20) NOT NULL
+-- 'want_to_read' | 'reading' | 'read' | 'did_not_finish'
 started_at      DATE
 finished_at     DATE
-is_public       BOOLEAN DEFAULT TRUE       -- hiện trên profile công khai
-note            TEXT                       -- ghi chú riêng tư
-source          VARCHAR(50)               -- 'google_books' | 'manual' | 'isbn_scan'
-created_at      TIMESTAMP DEFAULT NOW()
-updated_at      TIMESTAMP DEFAULT NOW()
 
-UNIQUE(user_id, catalog_id)               -- 1 user chỉ có 1 bản của mỗi sách
-```
+-- Thông tin mua / nhận sách
+acquired_how    VARCHAR(20)                    -- 'bought' | 'gift' | 'other'
+gift_from       VARCHAR(100)                   -- nếu được tặng: từ ai
+purchase_price  NUMERIC(10,2)                  -- giá mua
+purchase_where  VARCHAR(200)                   -- mua ở đâu (Fahasa, Shopee, hội sách...)
+purchase_reason TEXT                           -- tại sao mua
 
-### 4.4 reviews (cảm nhận công khai) ← TRỌNG TÂM
+-- Đánh giá sau khi đọc (private)
+personal_rating  SMALLINT CHECK (personal_rating BETWEEN 1 AND 5)
+met_expectations BOOLEAN                       -- có xứng đáng với kì vọng trước khi mua?
+personal_note    TEXT                          -- ghi chú riêng tư
 
-```sql
-id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-catalog_id      UUID REFERENCES book_catalog(id) ON DELETE CASCADE
-user_id         UUID REFERENCES users(id) ON DELETE CASCADE
-user_book_id    UUID REFERENCES user_books(id)  -- liên kết với bản cá nhân
+-- Ảnh thực tế cuốn sách (nếu khác cover online)
+physical_cover_url VARCHAR(500)
 
--- Nội dung
-rating          SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5)
-title           VARCHAR(300)               -- tiêu đề review (tùy chọn)
-body            TEXT NOT NULL              -- nội dung review (Tiptap HTML, tối đa 10.000 ký tự)
-body_plain      TEXT                       -- plain text để full-text search
-has_spoiler     BOOLEAN DEFAULT FALSE      -- cảnh báo spoiler
+-- Cho mượn
+can_lend        BOOLEAN DEFAULT FALSE          -- có cho mượn không
+deposit_amount  NUMERIC(10,2) DEFAULT 0        -- tiền cọc yêu cầu (0 = không cần cọc)
+lend_note       TEXT                           -- ghi chú điều kiện mượn
 
--- Cảm xúc / mood tags (chọn nhiều)
--- Ví dụ: ['inspiring', 'emotional', 'thought_provoking', 'easy_read', 'dense', 'boring']
-mood_tags       VARCHAR(50)[]
-
--- Trích dẫn yêu thích từ sách
-favorite_quote  TEXT
-
--- Đối tượng đề xuất đọc
-recommend_to    TEXT                       -- "Dành cho ai thích..."
-
--- Thống kê (denormalized, cập nhật realtime)
-upvote_count    INTEGER DEFAULT 0
-comment_count   INTEGER DEFAULT 0
-
--- Trạng thái
+-- Metadata
+tags            VARCHAR(50)[]                  -- nhãn cá nhân
 is_public       BOOLEAN DEFAULT TRUE
-is_edited       BOOLEAN DEFAULT FALSE
 created_at      TIMESTAMP DEFAULT NOW()
 updated_at      TIMESTAMP DEFAULT NOW()
 
-UNIQUE(user_id, catalog_id)               -- 1 user chỉ viết 1 review / sách
+UNIQUE(user_id, catalog_id)
 ```
 
-**Mood tags được định nghĩa sẵn:**
-
-| Tag | Label | Emoji |
-|-----|-------|-------|
-| `inspiring` | Truyền cảm hứng | ✨ |
-| `emotional` | Cảm động | 😢 |
-| `thought_provoking` | Kích thích tư duy | 🧠 |
-| `easy_read` | Dễ đọc | 😊 |
-| `dense` | Nặng, đọc chậm | 📚 |
-| `practical` | Thực tiễn, áp dụng được | 🔧 |
-| `boring` | Nhàm chán | 😴 |
-| `page_turner` | Không thể đặt xuống | 🔥 |
-| `life_changing` | Thay đổi quan điểm sống | 🌟 |
-| `overrated` | Bị đánh giá quá cao | 🤔 |
-| `underrated` | Xứng đáng nổi tiếng hơn | 💎 |
-| `reread_worthy` | Đọc lại nhiều lần vẫn hay | ♻️ |
-
-### 4.5 review_reactions (emoji reaction trên review)
-```sql
-id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-review_id       UUID REFERENCES reviews(id) ON DELETE CASCADE
-user_id         UUID REFERENCES users(id) ON DELETE CASCADE
-emoji           VARCHAR(20) NOT NULL
--- Giá trị: 'heart' | 'thumbs_up' | 'wow' | 'sad' | 'fire' | 'thinking'
-created_at      TIMESTAMP DEFAULT NOW()
-
-UNIQUE(review_id, user_id, emoji)         -- 1 user chỉ react 1 loại emoji / review
--- Nhưng có thể react nhiều emoji khác nhau trên cùng 1 review
-```
-
-**Emoji palette:**
-
-| Key | Emoji | Ý nghĩa |
-|-----|-------|---------|
-| `heart` | ❤️ | Yêu thích |
-| `thumbs_up` | 👍 | Đồng ý, hữu ích |
-| `wow` | 😮 | Bất ngờ |
-| `sad` | 😢 | Cảm động |
-| `fire` | 🔥 | Xuất sắc |
-| `thinking` | 🤔 | Thú vị, đáng suy nghĩ |
-
-### 4.6 comments (bình luận, có thread) ← TRỌNG TÂM
-```sql
-id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-review_id       UUID REFERENCES reviews(id) ON DELETE CASCADE
-user_id         UUID REFERENCES users(id) ON DELETE CASCADE
-parent_id       UUID REFERENCES comments(id) ON DELETE CASCADE
--- NULL = comment gốc; non-NULL = reply vào comment cha
-
-body            TEXT NOT NULL              -- tối đa 2000 ký tự
-mentioned_user_ids UUID[]                 -- @mention: danh sách user được nhắc
-
--- Thống kê
-upvote_count    INTEGER DEFAULT 0
-downvote_count  INTEGER DEFAULT 0
-
--- Trạng thái
-is_edited       BOOLEAN DEFAULT FALSE
-is_deleted      BOOLEAN DEFAULT FALSE      -- soft delete, giữ thread
-created_at      TIMESTAMP DEFAULT NOW()
-updated_at      TIMESTAMP DEFAULT NOW()
-
--- Giới hạn thread: chỉ 1 cấp reply (comment → reply, reply không có reply)
--- Thực thi ở application layer, không phải DB constraint
-```
-
-### 4.7 comment_votes (vote trên bình luận)
-```sql
-id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-comment_id      UUID REFERENCES comments(id) ON DELETE CASCADE
-user_id         UUID REFERENCES users(id) ON DELETE CASCADE
-value           SMALLINT NOT NULL CHECK (value IN (1, -1))
--- 1 = upvote, -1 = downvote
-created_at      TIMESTAMP DEFAULT NOW()
-
-UNIQUE(comment_id, user_id)               -- 1 user chỉ vote 1 lần / comment
-```
-
-### 4.8 review_votes (vote tổng thể cho review — "review này có hữu ích không?")
-```sql
-id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-review_id       UUID REFERENCES reviews(id) ON DELETE CASCADE
-user_id         UUID REFERENCES users(id) ON DELETE CASCADE
-value           SMALLINT NOT NULL CHECK (value IN (1, -1))
-created_at      TIMESTAMP DEFAULT NOW()
-
-UNIQUE(review_id, user_id)
-```
-
-### 4.9 follows (theo dõi user khác)
-```sql
-id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-follower_id     UUID REFERENCES users(id) ON DELETE CASCADE
-following_id    UUID REFERENCES users(id) ON DELETE CASCADE
-created_at      TIMESTAMP DEFAULT NOW()
-
-UNIQUE(follower_id, following_id)
-CHECK (follower_id != following_id)
-```
-
-### 4.10 content_reports (báo cáo nội dung vi phạm)
-```sql
-id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-reporter_id     UUID REFERENCES users(id)
-content_type    VARCHAR(20) NOT NULL       -- 'review' | 'comment'
-content_id      UUID NOT NULL
-reason          VARCHAR(50) NOT NULL
--- 'spam' | 'spoiler_unmarked' | 'offensive' | 'misinformation' | 'other'
-detail          TEXT
-status          VARCHAR(20) DEFAULT 'pending' -- 'pending' | 'resolved' | 'dismissed'
-created_at      TIMESTAMP DEFAULT NOW()
-```
-
-### 4.11 loans (cho mượn — giữ nguyên)
+### 4.5 loan_requests (yêu cầu mượn)
 ```sql
 id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
 user_book_id    UUID REFERENCES user_books(id) ON DELETE CASCADE
 lender_id       UUID REFERENCES users(id)
-borrower_name   VARCHAR(100) NOT NULL
-borrower_user_id UUID REFERENCES users(id)
-borrower_contact VARCHAR(200)
-lent_at         DATE NOT NULL DEFAULT NOW()
-due_at          DATE
-returned_at     DATE
-note            TEXT
-status          VARCHAR(20) DEFAULT 'active'
+borrower_id     UUID REFERENCES users(id)
+
+message         TEXT                           -- tin nhắn từ người muốn mượn
+status          VARCHAR(20) DEFAULT 'pending'
+-- 'pending' | 'approved' | 'rejected' | 'cancelled'
+
+-- Điền khi approve
+agreed_deposit  NUMERIC(10,2)                  -- cọc đã thoả thuận
+meet_location   TEXT                           -- "tầng trệt, chiều thứ 6"
+agreed_at       TIMESTAMP
+
+rejected_reason TEXT
 created_at      TIMESTAMP DEFAULT NOW()
+updated_at      TIMESTAMP DEFAULT NOW()
 ```
 
-### 4.12 shared_lists
+### 4.6 loans (phiếu mượn đang active)
 ```sql
 id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
-user_id         UUID REFERENCES users(id)
-name            VARCHAR(200) NOT NULL
-description     TEXT
-slug            VARCHAR(100) UNIQUE NOT NULL
-catalog_ids     UUID[]
-is_public       BOOLEAN DEFAULT TRUE
+loan_request_id UUID REFERENCES loan_requests(id)
+user_book_id    UUID REFERENCES user_books(id) ON DELETE CASCADE
+lender_id       UUID REFERENCES users(id)
+borrower_id     UUID REFERENCES users(id)
+
+lent_at         DATE NOT NULL DEFAULT CURRENT_DATE
+due_at          DATE
+returned_at     DATE
+
+status          VARCHAR(20) DEFAULT 'active'
+-- 'active' | 'returned' | 'overdue' | 'lost'
+
+lender_note     TEXT
 created_at      TIMESTAMP DEFAULT NOW()
+updated_at      TIMESTAMP DEFAULT NOW()
 ```
 
-### 4.13 notifications
+### 4.7 borrower_ratings (đánh giá người mượn — private)
+```sql
+id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
+loan_id         UUID REFERENCES loans(id)
+lender_id       UUID REFERENCES users(id)
+borrower_id     UUID REFERENCES users(id)
+is_positive     BOOLEAN NOT NULL               -- positive hoặc negative
+note            TEXT                           -- lý do (không trả đúng hạn, sách hỏng...)
+created_at      TIMESTAMP DEFAULT NOW()
+
+UNIQUE(loan_id)                                -- 1 loan → 1 rating
+```
+
+### 4.8 borrower_blacklist
+```sql
+id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
+lender_id       UUID REFERENCES users(id)
+blocked_user_id UUID REFERENCES users(id)
+reason          TEXT
+created_at      TIMESTAMP DEFAULT NOW()
+
+UNIQUE(lender_id, blocked_user_id)
+CHECK (lender_id != blocked_user_id)
+```
+
+### 4.9 notifications
 ```sql
 id              UUID PRIMARY KEY DEFAULT gen_random_uuid()
 user_id         UUID REFERENCES users(id)
 type            VARCHAR(50)
--- 'loan_due_soon' | 'loan_overdue'
--- 'new_comment_on_review'  -- ai đó comment vào review của mình
--- 'new_reply_on_comment'   -- ai đó reply comment của mình
--- 'review_voted'           -- review của mình được vote
--- 'mention'                -- bị @mention trong comment
--- 'new_follower'           -- có người follow mình
--- 'borrow_request' | 'borrow_approved'
+-- 'loan_request_received'   -- có người muốn mượn sách của mình
+-- 'loan_request_approved'   -- yêu cầu mượn được chấp nhận
+-- 'loan_request_rejected'   -- yêu cầu mượn bị từ chối
+-- 'loan_due_soon'           -- sắp đến hạn trả (3 ngày trước)
+-- 'loan_overdue'            -- quá hạn trả
 title           VARCHAR(200)
 body            TEXT
-actor_id        UUID REFERENCES users(id)  -- người thực hiện hành động
-content_type    VARCHAR(20)               -- 'review' | 'comment' | 'loan'
+actor_id        UUID REFERENCES users(id)      -- người thực hiện hành động
+content_type    VARCHAR(20)                    -- 'loan_request' | 'loan'
 content_id      UUID
 is_read         BOOLEAN DEFAULT FALSE
 created_at      TIMESTAMP DEFAULT NOW()
@@ -334,330 +258,156 @@ created_at      TIMESTAMP DEFAULT NOW()
 
 ## 5. API Endpoints
 
-### Auth
+### Auth (Google OAuth)
 ```
-POST /api/auth/register
-POST /api/auth/login
+GET  /api/auth/google                         -- redirect đến Google OAuth
+GET  /api/auth/google/callback                -- Google callback, trả về JWT
 POST /api/auth/refresh
 POST /api/auth/logout
-PUT  /api/auth/password
+POST /api/auth/phone/send-otp                 -- gửi OTP xác thực số điện thoại
+POST /api/auth/phone/verify                   -- confirm OTP
 ```
 
-### Book Catalog (thực thể sách chung)
+### Book Catalog
 ```
-GET  /api/catalog/lookup/isbn/{isbn}       -- tra Google Books theo ISBN
-GET  /api/catalog/search?q=               -- tìm kiếm sách (Google Books + catalog nội bộ)
-GET  /api/catalog/{id}                    -- chi tiết sách: info + aggregate reviews
-GET  /api/catalog/{id}/reviews            -- tất cả reviews của cuốn sách (sorted)
-GET  /api/catalog/{id}/stats              -- avg_rating, phân bổ rating, mood tags phổ biến
+GET  /api/catalog/lookup/isbn/{isbn}          -- tra Google Books theo ISBN
+GET  /api/catalog/search?q=                   -- tìm sách (Google Books + nội bộ)
+GET  /api/catalog/{id}                        -- chi tiết sách
 ```
 
 ### User Books (tủ sách cá nhân)
 ```
-GET    /api/books                         -- tủ sách của mình (filter, sort, search)
-POST   /api/books                         -- thêm sách vào tủ
-GET    /api/books/{id}                    -- chi tiết 1 bản sách trong tủ
-PUT    /api/books/{id}                    -- cập nhật (status, tags, note, dates)
-DELETE /api/books/{id}                    -- xóa khỏi tủ
+GET    /api/books                             -- tủ sách của mình (filter, sort, search)
+POST   /api/books                             -- thêm sách vào tủ
+GET    /api/books/{id}                        -- chi tiết 1 cuốn
+PUT    /api/books/{id}                        -- cập nhật mọi field
+DELETE /api/books/{id}                        -- xóa khỏi tủ
 ```
 
-### Reviews ← TRỌNG TÂM
+### Lending
 ```
--- Tạo / sửa / xóa
-POST   /api/reviews                       -- viết review mới
-GET    /api/reviews/{id}                  -- chi tiết review
-PUT    /api/reviews/{id}                  -- sửa review
-DELETE /api/reviews/{id}                  -- xóa review
+-- Loan requests
+GET    /api/loan-requests                     -- requests gửi đến mình (lender view)
+GET    /api/loan-requests/sent                -- requests mình đã gửi (borrower view)
+POST   /api/books/{book_id}/request-loan      -- gửi yêu cầu mượn
+PUT    /api/loan-requests/{id}/approve        -- chấp nhận (kèm agreed_deposit, meet_location)
+PUT    /api/loan-requests/{id}/reject         -- từ chối (kèm lý do)
+DELETE /api/loan-requests/{id}               -- borrower tự cancel
 
--- Vote
-POST   /api/reviews/{id}/vote             -- vote { value: 1 | -1 }
-DELETE /api/reviews/{id}/vote             -- bỏ vote
+-- Active loans
+GET    /api/loans                             -- loans của mình (cả 2 chiều)
+PUT    /api/loans/{id}/confirm                -- lender confirm đã giao sách → active
+PUT    /api/loans/{id}/return                 -- lender mark đã nhận lại sách
+POST   /api/loans/{id}/rate                   -- rate borrower sau khi trả
 
--- Reactions (emoji)
-POST   /api/reviews/{id}/reactions        -- react { emoji: 'heart' | ... }
-DELETE /api/reviews/{id}/reactions/{emoji} -- bỏ reaction
-
--- Feed review của user khác
-GET    /api/users/{user_id}/reviews       -- tất cả reviews công khai của 1 user
-GET    /api/reviews/feed                  -- review mới từ những người mình follow
-```
-
-### Comments ← TRỌNG TÂM
-```
--- CRUD
-GET    /api/reviews/{review_id}/comments         -- danh sách comment (kèm replies)
-POST   /api/reviews/{review_id}/comments         -- tạo comment gốc
-POST   /api/reviews/{review_id}/comments/{id}/replies  -- reply vào comment
-PUT    /api/comments/{id}                        -- sửa comment
-DELETE /api/comments/{id}                        -- xóa (soft delete)
-
--- Vote
-POST   /api/comments/{id}/vote                   -- vote { value: 1 | -1 }
-DELETE /api/comments/{id}/vote                   -- bỏ vote
+-- Blacklist
+GET    /api/blacklist                         -- danh sách blacklist của mình
+POST   /api/blacklist                         -- block { blocked_user_id, reason }
+DELETE /api/blacklist/{blocked_user_id}       -- unblock
 ```
 
-### Social
+### Community (toà nhà)
 ```
--- Follow
-POST   /api/users/{id}/follow             -- follow user
-DELETE /api/users/{id}/follow             -- unfollow
-GET    /api/users/{id}/followers          -- danh sách follower
-GET    /api/users/{id}/following          -- danh sách đang follow
-
--- Activity feed
-GET    /api/feed                          -- hoạt động của người mình follow
-                                          -- (mới thêm sách, viết review, đọc xong)
-
--- Report
-POST   /api/reports                       -- báo cáo review / comment
+POST   /api/buildings                         -- tạo toà nhà mới
+POST   /api/buildings/join                    -- join bằng invite_code
+GET    /api/buildings/me                      -- info toà nhà đang ở
+GET    /api/buildings/books                   -- sách available từ mọi người trong toà
+GET    /api/buildings/members                 -- danh sách thành viên
 ```
 
-### Public Profile
+### Public Profile + Notifications + Stats
 ```
-GET /api/public/users/{slug}              -- profile công khai
-GET /api/public/users/{slug}/books        -- tủ sách công khai
-GET /api/public/users/{slug}/reviews      -- reviews công khai của user
-GET /api/public/lists/{slug}              -- danh sách chia sẻ
-POST /api/public/books/{id}/request       -- gửi yêu cầu mượn
-```
+GET /api/public/users/{slug}                  -- profile công khai
+GET /api/public/users/{slug}/books            -- tủ sách công khai (is_public = true)
 
-### Loans, Lists, Notifications, Stats
-```
--- Loans (giữ nguyên)
-GET/POST       /api/loans
-GET/PUT/DELETE /api/loans/{id}
-PUT            /api/loans/{id}/return
+GET /api/notifications                        -- danh sách thông báo (polling)
+PUT /api/notifications/{id}/read
+PUT /api/notifications/read-all
 
--- Lists
-GET/POST       /api/lists
-GET/PUT/DELETE /api/lists/{id}
-
--- Notifications
-GET  /api/notifications
-PUT  /api/notifications/{id}/read
-PUT  /api/notifications/read-all
-GET  /api/notifications/stream            -- SSE endpoint cho real-time
-
--- Stats
-GET /api/stats/summary
-GET /api/stats/reading-pace
-GET /api/stats/genres
-GET /api/stats/reviews                    -- thống kê reviews của mình
+GET /api/stats/summary                        -- tổng sách, đã đọc, đang cho mượn...
+GET /api/stats/reading-pace                   -- tốc độ đọc theo tháng
+GET /api/stats/lending                        -- thống kê cho mượn / mượn
 ```
 
 ---
 
-## 6. Thiết kế chi tiết tính năng Social
+## 6. Thiết kế chi tiết: Lending
 
-### 6.1 Review — Cảm nhận sách
+### 6.1 Trạng thái cho mượn của một cuốn sách
 
-**Cấu trúc một review đầy đủ:**
+Không dùng `status = 'lent_out'` trong `user_books` (status đó mô tả trạng thái đọc, không phải vật lý). Trạng thái cho mượn được suy ra từ `loans` table:
+
 ```
-┌─────────────────────────────────────────────────────┐
-│  Avatar  Tên user  •  Đã đọc xong 12/03/2026       │
-│                                                     │
-│  ★★★★☆  4/5 sao                                    │
-│                                                     │
-│  [Tiêu đề review]                                   │
-│  "Cuốn sách thay đổi cách tôi nhìn về thói quen"   │
-│                                                     │
-│  [Mood tags]                                        │
-│  ✨ Truyền cảm hứng  🔧 Thực tiễn  🔥 Không thể đặt │
-│                                                     │
-│  [Nội dung review — rich text]                      │
-│  Atomic Habits là cuốn sách hiếm hoi mà tôi        │
-│  cảm thấy phải đọc chậm để thấm...                 │
-│                                                     │
-│  [Trích dẫn yêu thích]                              │
-│  ❝ You do not rise to the level of your goals,     │
-│    you fall to the level of your systems. ❞         │
-│                                                     │
-│  [Đề xuất]                                          │
-│  Dành cho ai muốn thay đổi thói quen nhưng hay... │
-│                                                     │
-│  ❤️ 12  👍 8  🔥 5  😮 2               [Hữu ích? 👍24]│
-│  [Bình luận 7]                                      │
-└─────────────────────────────────────────────────────┘
+user_book.can_lend = true
+    → Check: có loan nào với status='active' không?
+        → Không có → [Có thể mượn]
+        → Có → [Đang được mượn bởi X]
 ```
 
-**Quy tắc viết review:**
-- Phải có cuốn sách trong tủ với `status = 'read'`
-- Mỗi user chỉ có 1 review / cuốn sách (có thể sửa sau)
-- `body` bắt buộc, tối thiểu 50 ký tự
-- Nếu có spoiler → phải tick `has_spoiler`, nội dung sẽ bị blur cho người đọc
+### 6.2 Màn hình "Tủ sách toà nhà"
 
-**Spoiler block trong rich text:**
-Tiptap custom extension `SpoilerBlock` cho phép writer đánh dấu từng đoạn là spoiler, render ra:
-```html
-<div class="spoiler-block" data-revealed="false">
-  <span class="spoiler-warning">⚠️ Nhấn để xem spoiler</span>
-  <div class="spoiler-content hidden">...</div>
-</div>
-```
-
-### 6.2 Hệ thống Vote
-
-**Vote trên review (helpful/not helpful):**
-- Toggle: vote lần 2 → bỏ vote
-- Không thể vote review của chính mình
-- `upvote_count` được lưu denormalized trong `reviews`, cập nhật qua DB trigger
-- Redis cache `review_vote:{review_id}:{user_id}` = 1 | -1 | null để kiểm tra vote state nhanh
-
-**Vote trên comment (upvote / downvote):**
-- Score = upvote_count - downvote_count
-- Comment bị ẩn tự động nếu score < -5 (hiện link "Xem bình luận bị ẩn")
-- Không thể vote comment của chính mình
-
-**Thứ tự sort comments:**
-```
-Mặc định: "Nổi bật" = hot score theo Wilson score confidence interval
-Alt: "Mới nhất" = created_at DESC
-Alt: "Cũ nhất" = created_at ASC
-```
-
-**Hot score (Wilson score):**
-```python
-def wilson_score(upvotes: int, total: int) -> float:
-    if total == 0:
-        return 0
-    z = 1.96  # 95% confidence
-    phat = upvotes / total
-    return (phat + z*z/(2*total) - z * sqrt((phat*(1-phat)+z*z/(4*total))/total)) \
-           / (1 + z*z/total)
-```
-
-### 6.3 Emoji Reactions trên Review
-
-Khác với vote (đánh giá chất lượng review), reaction là biểu đạt cảm xúc với nội dung review. User có thể react nhiều emoji trên cùng 1 review.
-
-**Hiển thị:**
-```
-❤️ 12  👍 8  🔥 5  😢 3  😮 2  🤔 1
-```
-Click vào emoji đã react → bỏ; click emoji chưa react → thêm.
-
-**API:**
-```
-POST /api/reviews/{id}/reactions   body: { emoji: "heart" }
-DELETE /api/reviews/{id}/reactions/heart
-```
-
-**Cache Redis:**
-- `review_reactions:{review_id}` → Hash `{ heart: 12, thumbs_up: 8, ... }`
-- `user_review_reaction:{user_id}:{review_id}` → Set các emoji user đã react
-- TTL: 10 phút, invalidate khi có thay đổi
-
-### 6.4 Bình luận (Comments & Threads)
-
-**Cấu trúc hiển thị:**
-```
-📝 MinhDev  •  2 giờ trước                              [+3] [−1]
-   Review hay lắm! Tôi cũng đọc xong rồi và đồng ý
-   với bạn về phần "habit stacking"
-
-   └─ 📝 PhiHong  •  1 giờ trước (phản hồi @MinhDev)   [+1]
-      Đúng rồi! Bạn đã áp dụng technique đó chưa?
-
-   └─ 📝 AnhTu  •  30 phút trước                        [+2]
-      Mình áp dụng được 3 tuần rồi, hiệu quả lắm 💪
-
-📝 LinhNguyen  •  5 giờ trước                           [+7] [−0]
-   Phần trích dẫn bạn chọn rất hay, câu đó mình
-   highlight trong sách rồi 😄
-```
-
-**Luồng render comments:**
-1. Fetch comments gốc (parent_id IS NULL), sorted by hot score
-2. Mỗi comment gốc fetch tối đa 3 reply đầu
-3. "Xem thêm N phản hồi" → lazy load phần còn lại
-4. Thread chỉ sâu 1 cấp — reply của reply không tạo thêm indent, chỉ hiện @mention
-
-**@mention trong comment:**
-- User gõ `@` → dropdown gợi ý user đang trong thread
-- Frontend parse và convert thành `<span data-mention-id="uuid">@Tên</span>`
-- Backend extract mention IDs → lưu vào `comments.mentioned_user_ids`
-- Notification được gửi đến user được mention
-
-**Soft delete:**
-Khi xóa comment có replies, không xóa vật lý mà đặt `is_deleted = true`. Hiển thị:
-```
-[Bình luận đã bị xóa]
-   └─ 📝 MinhDev  •  phản hồi ...  (reply vẫn còn)
-```
-
-### 6.5 Trang sách tổng hợp (Book Detail — Social View)
-
-Trang `/books/{catalog_id}` là trang công khai cho mọi người:
+Hiển thị tất cả sách `can_lend = true` và không có active loan, từ mọi thành viên cùng building:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  [Ảnh bìa]  Atomic Habits                          │
-│             James Clear  •  2018  •  320 trang      │
-│                                                     │
-│  ⭐ 4.3 / 5  (từ 24 reviews)                        │
-│  ████████░░ 5 sao: 14                              │
-│  ██████░░░░ 4 sao: 8                               │
-│  ██░░░░░░░░ 3 sao: 2                               │
-│  ░░░░░░░░░░ 2 sao: 0                               │
-│  ░░░░░░░░░░ 1 sao: 0                               │
-│                                                     │
-│  Mood tags phổ biến:                                │
-│  ✨×18  🔧×15  🔥×12  🧠×9  😊×7                    │
-│                                                     │
-│  [Nút: Thêm vào tủ / Viết review / Yêu cầu mượn]  │
+│  📚 Tủ sách toà nhà                   15 cuốn sẵn  │
 ├─────────────────────────────────────────────────────┤
-│  REVIEWS (24)                       [Sắp xếp ▾]   │
-│  ○ Nổi bật  ○ Mới nhất  ○ Tin cậy nhất            │
+│  [Cover] Atomic Habits                              │
+│          James Clear                                │
+│          Chủ: PhiHong · Tầng 5  •  Cọc: 50.000đ  │
+│          [Yêu cầu mượn]                            │
 │                                                     │
-│  [Review card 1 — nổi bật nhất]                    │
-│  [Review card 2]                                    │
-│  [Review card 3]                                    │
-│  ...                        [Xem thêm 21 reviews]  │
+│  [Cover] Nhà Giả Kim                               │
+│          Paulo Coelho                               │
+│          Chủ: MinhDev · Tầng 2  •  Không cần cọc  │
+│          [Yêu cầu mượn]                            │
 └─────────────────────────────────────────────────────┘
 ```
 
-**Sort options cho reviews:**
-- **Nổi bật** (default): `upvote_count DESC, comment_count DESC`
-- **Mới nhất**: `created_at DESC`
-- **Tin cậy nhất**: Wilson score trên upvote/(upvote+downvote)
-- **Đánh giá cao nhất**: `rating DESC`
-- **Đánh giá thấp nhất**: `rating ASC`
-
-**Filter reviews:**
-- Theo số sao (1–5)
-- Chỉ hiện review có spoiler warning
-- Chỉ hiện review từ người mình follow
-
-### 6.6 Activity Feed (Bảng tin)
-
-Trang `/feed` hiển thị hoạt động của những người mình follow:
+### 6.3 Flow yêu cầu mượn chi tiết
 
 ```
-📚 PhiHong vừa đọc xong "Sapiens" — 2 giờ trước
-   ★★★★★  "Cuốn sách làm thay đổi cách nhìn lịch sử..."
-   [Xem review đầy đủ]
-
-📖 MinhDev đang đọc "Deep Work" — 5 giờ trước
-
-❤️ AnhTu react ❤️ vào review của LinhNguyen về "Atomic Habits" — 1 ngày trước
-
-➕ TuanAnh vừa thêm "The Psychology of Money" vào tủ — 2 ngày trước
+Borrower click [Yêu cầu mượn]
+    ↓
+Kiểm tra:
+  - phone_verified = true? (nếu không → redirect verify phone)
+  - Không nằm trong blacklist của lender?
+    ↓
+Điền form: tin nhắn ngắn (optional) → Submit
+    ↓
+Lender nhận notification "Có người muốn mượn [Tên sách]"
+    ↓
+Lender vào xem → Approve hoặc Reject
+    ↓ Approve
+Lender điền: tiền cọc thoả thuận + địa điểm hẹn
+Borrower nhận notification "Được chấp nhận — hẹn gặp ở X, cọc Y đồng"
+    ↓
+[Gặp nhau ngoài đời, trao sách, chuyển khoản cọc]
+    ↓
+Lender confirm trong app → Loan status = 'active'
+    ↓
+[Thời gian mượn]
+Notification tự động nhắc borrower 3 ngày trước due_at
+    ↓
+Trả sách → Lender click [Đã nhận lại] → status = 'returned'
+    ↓
+Lender có thể rate: 👍 Tốt / 👎 Không tốt + ghi chú
 ```
 
-**Các loại activity event:**
-| Event type | Trigger | Hiển thị |
-|-----------|---------|---------|
-| `book_finished` | `status` → `read` | "X vừa đọc xong [sách]" + snippet review nếu có |
-| `book_started` | `status` → `reading` | "X đang đọc [sách]" |
-| `book_added` | Thêm sách mới vào tủ | "X vừa thêm [sách] vào tủ" |
-| `review_posted` | Tạo review mới | "X vừa review [sách]" + title + rating |
-| `review_reacted` | React vào review | "X react [emoji] vào review của Y" |
+### 6.4 Blacklist
 
-**Hiệu năng feed:**
-- Không dùng pull-based fanout (query n người đang follow mỗi lần load)
-- Dùng pre-generated feed: khi user A có activity → push event vào Redis list của mỗi follower
-- Key: `feed:{user_id}` → Redis sorted set (score = timestamp)
-- TTL: 30 ngày, tối đa 200 events/user
+Trigger để block:
+- Lender mark loan là `lost`
+- Lender rate negative và chọn "Block người này"
+- Hoặc thủ công trong Settings
+
+Khi bị block:
+- Button [Yêu cầu mượn] ẩn đối với lender đó
+- Không có thông báo gì cho borrower (silent block)
+
+Lender quản lý blacklist trong `/settings/blacklist`:
+- Xem danh sách, lý do, ngày block
+- Có thể unblock bất kỳ lúc nào
 
 ---
 
@@ -669,102 +419,76 @@ book-manager/
 │   ├── app/
 │   │   ├── api/
 │   │   │   ├── routes/
-│   │   │   │   ├── auth.py
-│   │   │   │   ├── books.py           -- user_books CRUD
-│   │   │   │   ├── catalog.py         -- book_catalog + aggregate
-│   │   │   │   ├── reviews.py         -- review CRUD + vote + reactions
-│   │   │   │   ├── comments.py        -- comment CRUD + vote
-│   │   │   │   ├── social.py          -- follow, feed, activity
-│   │   │   │   ├── loans.py
-│   │   │   │   ├── lists.py
-│   │   │   │   ├── public.py
+│   │   │   │   ├── auth.py              -- Google OAuth + phone verify
+│   │   │   │   ├── books.py             -- user_books CRUD
+│   │   │   │   ├── catalog.py           -- book_catalog + Google Books API
+│   │   │   │   ├── loans.py             -- loan_requests + loans + ratings + blacklist
+│   │   │   │   ├── community.py         -- buildings, tủ sách toà nhà
+│   │   │   │   ├── public.py            -- public profiles
 │   │   │   │   ├── notifications.py
 │   │   │   │   └── stats.py
-│   │   │   └── deps.py
+│   │   │   └── deps.py                  -- auth dependency, get_current_user
 │   │   ├── core/
 │   │   │   ├── config.py
-│   │   │   ├── security.py
-│   │   │   ├── scheduler.py           -- cron: loan reminders, feed cleanup
-│   │   │   └── sse.py                 -- Server-Sent Events manager
+│   │   │   ├── security.py              -- JWT + Google OAuth
+│   │   │   └── scheduler.py             -- cron: nhắc hạn trả, mark overdue
 │   │   ├── db/
-│   │   │   ├── models.py
-│   │   │   ├── schemas/
-│   │   │   │   ├── review.py
-│   │   │   │   ├── comment.py
-│   │   │   │   └── social.py
+│   │   │   ├── models.py                -- tất cả SQLAlchemy models
+│   │   │   ├── schemas/                 -- Pydantic request/response schemas
+│   │   │   │   ├── book.py
+│   │   │   │   ├── loan.py
+│   │   │   │   └── user.py
 │   │   │   └── session.py
 │   │   ├── services/
-│   │   │   ├── book_service.py
-│   │   │   ├── google_books.py
-│   │   │   ├── review_service.py
-│   │   │   ├── comment_service.py
-│   │   │   ├── vote_service.py        -- xử lý vote + cập nhật counter
-│   │   │   ├── reaction_service.py
-│   │   │   ├── feed_service.py        -- fanout activity vào Redis
-│   │   │   ├── loan_service.py
-│   │   │   └── notification_service.py
+│   │   │   ├── google_books.py          -- Google Books API client
+│   │   │   ├── loan_service.py          -- business logic cho lending flow
+│   │   │   ├── notification_service.py
+│   │   │   └── cloudinary_service.py
 │   │   └── main.py
-│   ├── migrations/
+│   ├── migrations/                      -- Alembic migrations
 │   ├── tests/
-│   │   ├── test_reviews.py
-│   │   ├── test_comments.py
-│   │   └── test_votes.py
+│   │   ├── test_books.py
+│   │   └── test_loans.py
 │   ├── Dockerfile
 │   └── requirements.txt
 │
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
-│   │   │   ├── ui/                    -- shadcn components
+│   │   │   ├── ui/                      -- shadcn components
 │   │   │   ├── book/
-│   │   │   │   ├── BookCard.tsx
-│   │   │   │   ├── BookForm.tsx
-│   │   │   │   └── ISBNScanner.tsx
-│   │   │   ├── review/
-│   │   │   │   ├── ReviewCard.tsx     -- hiển thị 1 review
-│   │   │   │   ├── ReviewEditor.tsx   -- Tiptap editor viết review
-│   │   │   │   ├── ReviewList.tsx     -- danh sách reviews có sort/filter
-│   │   │   │   ├── RatingDistribution.tsx
-│   │   │   │   ├── MoodTagSelector.tsx
-│   │   │   │   ├── MoodTagCloud.tsx   -- hiển thị tags phổ biến
-│   │   │   │   └── SpoilerBlock.tsx   -- Tiptap extension
-│   │   │   ├── comment/
-│   │   │   │   ├── CommentThread.tsx  -- thread 1 comment gốc + replies
-│   │   │   │   ├── CommentList.tsx    -- danh sách comment threads
-│   │   │   │   ├── CommentForm.tsx    -- form viết / sửa
-│   │   │   │   └── MentionDropdown.tsx
-│   │   │   ├── social/
-│   │   │   │   ├── VoteButton.tsx     -- nút vote generic (dùng cho review + comment)
-│   │   │   │   ├── ReactionBar.tsx    -- emoji reaction bar
-│   │   │   │   ├── ActivityFeedItem.tsx
-│   │   │   │   └── FollowButton.tsx
-│   │   │   └── loan/
-│   │   │       └── LoanForm.tsx
+│   │   │   │   ├── BookCard.tsx          -- hiển thị 1 cuốn trong tủ
+│   │   │   │   ├── BookForm.tsx          -- thêm / sửa sách (có đầy đủ personal fields)
+│   │   │   │   ├── ISBNScanner.tsx       -- scan ISBN bằng camera (Phase 3)
+│   │   │   │   └── CoverUpload.tsx       -- upload ảnh bìa thực tế
+│   │   │   ├── lending/
+│   │   │   │   ├── CommunityShelf.tsx    -- tủ sách toà nhà
+│   │   │   │   ├── LoanRequestForm.tsx   -- form gửi yêu cầu mượn
+│   │   │   │   ├── LoanRequestCard.tsx   -- card approve/reject (lender view)
+│   │   │   │   ├── ActiveLoanCard.tsx    -- card theo dõi loan đang active
+│   │   │   │   ├── BorrowerRating.tsx    -- form rate sau khi trả
+│   │   │   │   └── BlacklistManager.tsx  -- quản lý blacklist
+│   │   │   └── shared/
+│   │   │       ├── StarRating.tsx
+│   │   │       └── PhoneVerifyModal.tsx
 │   │   ├── pages/
-│   │   │   ├── HomePage.tsx           -- feed + dashboard
-│   │   │   ├── BookshelfPage.tsx
-│   │   │   ├── BookDetailPage.tsx     -- trang sách cá nhân
-│   │   │   ├── CatalogBookPage.tsx    -- trang sách công khai + all reviews
-│   │   │   ├── ReviewDetailPage.tsx   -- 1 review đầy đủ + comments
-│   │   │   ├── FeedPage.tsx           -- activity feed từ following
-│   │   │   ├── LoansPage.tsx
-│   │   │   ├── PublicProfilePage.tsx
-│   │   │   ├── SharedListPage.tsx
-│   │   │   └── StatsPage.tsx
+│   │   │   ├── BookshelfPage.tsx         -- tủ sách cá nhân
+│   │   │   ├── BookDetailPage.tsx        -- chi tiết + edit một cuốn
+│   │   │   ├── CommunityPage.tsx         -- tủ sách toà nhà
+│   │   │   ├── LendingPage.tsx           -- quản lý cho mượn (lender + borrower view)
+│   │   │   ├── NotificationsPage.tsx
+│   │   │   ├── StatsPage.tsx
+│   │   │   ├── SettingsPage.tsx          -- profile, phone verify, blacklist
+│   │   │   └── PublicProfilePage.tsx
 │   │   ├── stores/
 │   │   │   ├── authStore.ts
 │   │   │   ├── bookStore.ts
-│   │   │   ├── reviewStore.ts
-│   │   │   ├── commentStore.ts
-│   │   │   └── notificationStore.ts
+│   │   │   └── loanStore.ts
 │   │   ├── hooks/
-│   │   │   ├── useVote.ts
-│   │   │   ├── useReaction.ts
-│   │   │   ├── useSSE.ts              -- nhận notification real-time
-│   │   │   └── useInfiniteScroll.ts
-│   │   ├── api/
-│   │   └── types/
-│   ├── public/
+│   │   │   ├── useBooks.ts
+│   │   │   ├── useLoans.ts
+│   │   │   └── useNotifications.ts      -- polling mỗi 30s
+│   │   └── api/                         -- axios wrappers cho từng endpoint
 │   ├── Dockerfile
 │   ├── vite.config.ts
 │   └── package.json
@@ -778,88 +502,97 @@ book-manager/
 
 ## 8. Luồng chính (User Flows)
 
-### 8.1 Viết review sau khi đọc xong
+### 8.1 Đăng ký và setup
 ```
-Đổi status → 'read'
-  → Popup: "Bạn vừa đọc xong! Chia sẻ cảm nhận?"  [Viết review] [Để sau]
-  → ReviewEditor mở ra
-  → Chọn rating (bắt buộc) + mood tags + tiêu đề + nội dung
-  → Preview → Publish
-  → Review xuất hiện trên trang sách public + feed của followers
-```
-
-### 8.2 Vote và tương tác với review
-```
-Visitor / User đọc review
-  → Click ❤️ / 👍 / 🔥 → Reaction tăng ngay (optimistic update)
-  → Click [Hữu ích?] → Upvote review → upvote_count tăng
-  → Click [Bình luận] → CommentForm mở
-  → Gõ comment + @mention → Submit
-  → Tác giả review nhận notification → vào xem → reply
-  → User gốc nhận notification về reply
+Vào app → [Đăng nhập bằng Google]
+    → Google OAuth → Tạo account tự động
+    → Nhập số điện thoại → Nhận OTP → Verify
+    → Nhập invite_code của toà nhà (hoặc tạo toà nhà mới)
+    → Sẵn sàng dùng
 ```
 
-### 8.3 Khám phá sách qua reviews
+### 8.2 Thêm sách vào tủ
 ```
-Search sách  →  Vào CatalogBookPage
-  → Xem rating tổng hợp + mood tags phổ biến
-  → Đọc review nổi bật (không cần đăng nhập)
-  → Click "Xem bình luận" → đọc thảo luận
-  → Thấy hay → "Thêm vào tủ muốn đọc" (cần đăng nhập)
-  → Follow tác giả review có gu đọc tương tự
+Click [Thêm sách]
+    ↓
+Nhập ISBN → Google Books API tự fill title, author, cover
+(hoặc tìm theo tên, hoặc nhập tay)
+    ↓
+Điền thông tin cá nhân:
+    • Mua hay được tặng? Từ ai / mua ở đâu? Giá bao nhiêu?
+    • Tại sao mua?
+    • Trạng thái đọc hiện tại?
+    • Cảm nhận cá nhân + có xứng đáng không? (nếu đã đọc)
+    • Có cho mượn không? Cọc bao nhiêu?
+    ↓
+Lưu → Xuất hiện trong tủ sách
 ```
 
-### 8.4 Thêm sách và cho mượn
+### 8.3 Mượn sách từ hàng xóm
 ```
-User nhập ISBN  →  Tra Google Books API  →  Hiện form điền sẵn
-             ↓ (không có ISBN)
-        Nhập tay  →  Lưu vào DB
+Vào [Tủ sách toà nhà]
+    → Xem danh sách sách available
+    → Click [Yêu cầu mượn] trên cuốn thích
+    → Nhập tin nhắn (optional) → Submit
+    → Chờ lender reply (nhận notification khi approve/reject)
+    → Nếu approve: gặp nhau, nhận sách, chuyển khoản cọc
+    → Đọc sách
+    → Trả sách → lender mark returned trong app
+```
 
-Chọn sách  →  Tạo phiếu mượn (tên, SĐT, hạn trả)
-           →  Scheduler nhắc 3 ngày trước hạn
-           →  User đánh dấu trả  →  status về 'read'
+### 8.4 Quản lý cho mượn (lender view)
+```
+Vào [Quản lý cho mượn]
+    → Tab "Chờ xử lý": approve / reject các requests
+    → Tab "Đang cho mượn": ai đang mượn gì, hạn bao giờ
+    → Tab "Lịch sử": các lần cho mượn trước
+    → Khi trả: [Đã nhận lại] → Rate borrower nếu muốn
 ```
 
 ---
 
 ## 9. Tính năng theo phase
 
-### Phase 1 — MVP (tuần 1-2)
-- [ ] Auth (đăng ký, đăng nhập)
-- [ ] Book catalog + user_books CRUD
-- [ ] Lookup sách từ Google Books API bằng ISBN / tên
-- [ ] Filter/search tủ sách cá nhân
-- [ ] Quản lý cho mượn cơ bản
+### Phase 1 — Catalog MVP (tuần 1-2)
+- [ ] Google OAuth login
+- [ ] Thêm sách bằng ISBN → auto-fill từ Google Books API
+- [ ] Nhập tay nếu không có ISBN
+- [ ] Đầy đủ personal fields: giá, mua ở đâu, tại sao, được tặng, cảm nhận, có xứng đáng
+- [ ] Trạng thái đọc (want_to_read, reading, read, did_not_finish)
+- [ ] Filter và search tủ sách cá nhân
+- [ ] Upload ảnh bìa thực tế
 
-### Phase 2 — Social Core (tuần 3-4) ← TRỌNG TÂM
-- [ ] Viết / sửa / xóa review (Tiptap editor, spoiler block)
-- [ ] Rating + mood tags
-- [ ] Vote review (upvote/downvote helpful)
-- [ ] Emoji reactions trên review
-- [ ] Trang sách tổng hợp reviews (`/books/{catalog_id}`)
-- [ ] Bình luận trên review (comment gốc)
+### Phase 2 — Lending Core (tuần 3-4)
+- [ ] Xác thực số điện thoại (OTP)
+- [ ] Tạo / join toà nhà bằng invite_code
+- [ ] Mark sách "sẵn sàng cho mượn" + đặt tiền cọc
+- [ ] Tủ sách toà nhà: xem sách available từ hàng xóm
+- [ ] Loan request flow: gửi → approve/reject → confirm giao sách
+- [ ] Active loans: theo dõi ai đang mượn gì, hạn trả
+- [ ] Mark đã trả
+- [ ] Notifications (polling 30s)
 
-### Phase 3 — Community (tuần 5-6)
-- [ ] Thread replies + @mention trong comment
-- [ ] Vote comment (upvote/downvote)
-- [ ] Follow / unfollow user
-- [ ] Activity feed từ following
-- [ ] Notification real-time (SSE)
-- [ ] Report nội dung vi phạm
-
-### Phase 4 — Public & Polish (tuần 7)
-- [ ] Profile công khai `/u/{slug}`
-- [ ] Danh sách chia sẻ `/list/{slug}`
-- [ ] Yêu cầu mượn qua profile
-- [ ] Dashboard thống kê
+### Phase 3 — Trust & Polish (tuần 5-6)
+- [ ] Rate borrower sau khi trả (positive / negative + ghi chú)
+- [ ] Blacklist borrower
+- [ ] Scheduler nhắc hạn trả (3 ngày trước, ngày hết hạn)
+- [ ] Auto-mark overdue khi quá hạn
+- [ ] ISBN scan bằng camera (quagga2 hoặc html5-qrcode)
+- [ ] Public profile `/u/{slug}`
 - [ ] Dark mode + mobile responsive
 
-### Phase 5 — Optional
-- [ ] Quét ISBN bằng camera (`quagga2`)
-- [ ] Import từ Goodreads CSV
-- [ ] Gợi ý sách dựa trên mood tags yêu thích
-- [ ] Export PDF danh sách tủ sách
-- [ ] PWA (offline access)
+### Phase 4 — Stats & Import (tuần 7)
+- [ ] Dashboard thống kê (tổng sách, tốc độ đọc theo tháng, lending stats)
+- [ ] Import sách từ Goodreads CSV
+- [ ] Export danh sách tủ sách
+
+### Phase 5 — Social (Optional, nếu muốn thách thức thêm)
+- [ ] Review công khai + star rating
+- [ ] Bình luận trên review
+- [ ] Follow user
+- [ ] Activity feed từ following
+- [ ] Real-time notifications (Server-Sent Events)
+- [ ] Redis cache cho vote counts và feed
 
 ---
 
@@ -867,16 +600,11 @@ Chọn sách  →  Tạo phiếu mượn (tên, SĐT, hạn trả)
 
 | Yêu cầu | Mục tiêu |
 |---------|----------|
-| API response time (P95) | < 200ms |
-| Trang review / comment load | < 300ms |
-| Vote / reaction response | < 100ms (optimistic update trên client) |
-| Real-time notification delay | < 5 giây (SSE polling fallback 30s) |
-| Search | < 500ms full-text search |
-| Auth token expiry | Access: 15 phút, Refresh: 30 ngày |
-| Rate limit — viết review | 10 reviews/ngày/user |
-| Rate limit — viết comment | 60 comments/giờ/user |
-| Rate limit — vote | 300 votes/giờ/user |
+| API response time (P95) | < 300ms |
+| Auth | Google OAuth; JWT access 15 phút, refresh 30 ngày |
+| Rate limit — loan request | 5 requests/ngày/user (tránh spam) |
 | Image upload | Max 5MB, resize về 400×600px |
+| Notifications polling | Mỗi 30 giây |
 | Responsive | Mobile-first, hoạt động tốt từ 375px |
 
 ---
@@ -886,17 +614,16 @@ Chọn sách  →  Tạo phiếu mượn (tên, SĐT, hạn trả)
 ```env
 # Backend
 DATABASE_URL=postgresql://user:pass@localhost:5432/bookmanager
-REDIS_URL=redis://localhost:6379
 SECRET_KEY=...
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
 GOOGLE_BOOKS_API_KEY=...
 CLOUDINARY_URL=...
 FRONTEND_URL=http://localhost:5173
 
-# Review content moderation (optional, Phase 3+)
-OPENAI_API_KEY=...    -- dùng để tự động detect nội dung spam / offensive
-
 # Frontend
 VITE_API_BASE_URL=http://localhost:8000
+VITE_GOOGLE_CLIENT_ID=...
 ```
 
 ---
@@ -914,15 +641,11 @@ services:
     ports: ["5432:5432"]
     volumes: [pgdata:/var/lib/postgresql/data]
 
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-
   backend:
     build: ./backend
     ports: ["8000:8000"]
     env_file: .env
-    depends_on: [postgres, redis]
+    depends_on: [postgres]
     volumes: [./backend:/app]
 
   frontend:
