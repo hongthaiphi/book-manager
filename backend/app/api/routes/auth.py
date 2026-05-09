@@ -72,6 +72,7 @@ async def google_login() -> RedirectResponse:
 
 
 @router.get("/google/callback")
+@router.get("/callback")          # alias: matches GOOGLE_REDIRECT_URI=/api/auth/callback
 async def google_callback(
     code: str,
     response: Response,
